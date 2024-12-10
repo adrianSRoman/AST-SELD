@@ -15,6 +15,8 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch.utils.data import Dataset, Sampler, DistributedSampler, WeightedRandomSampler
 
+import itertools
+
 class DistributedSamplerWrapper(DistributedSampler):
     # source: @awaelchli https://github.com/PyTorchLightning/pytorch-lightning/issues/3238
 
@@ -37,6 +39,7 @@ class DistributedSamplerWrapper(DistributedSampler):
         indices = indices[self.rank:self.total_size:self.num_replicas]
         return iter(indices)
         
+
 class DistributedWeightedSampler(Sampler):
     # dataset_train, samples_weight,  num_replicas=num_tasks, rank=global_rank
     def __init__(self, dataset, weights, num_replicas=None, rank=None, replacement=True, shuffle=True):
@@ -98,11 +101,16 @@ class DistributedWeightedSampler(Sampler):
 def make_index_dict(label_csv):
     index_lookup = {}
     with open(label_csv, 'r') as f:
-        csv_reader = csv.DictReader(f)
         line_count = 0
-        for row in csv_reader:
+        reader = csv.reader(f)
+        next(reader)  # Skip header
+        for row in reader:
+            print(row)
+            index, mid = row[0], row[1]
+            display_name = ",".join(row[2:])
             # index_lookup[row['mid']] = row['index']
-            index_lookup[row['mid']] = line_count
+            #index_lookup[row['mid']] = line_count
+            index_lookup[display_name] = line_count
             line_count += 1
     return index_lookup
 
@@ -121,19 +129,20 @@ def normalize_audio(audio_data, target_dBFS=-14.0):
 class MultichannelDataset(Dataset):
     def __init__(
             self, 
-            audio_json, audio_conf, audio_path_root,
+            audio_json, audio_conf, audio_path_root, meta_path_root,
             reverb_json, reverb_type, reverb_path_root,
             label_csv=None, roll_mag_aug=False, normalize=True,
             _ext_audio=".wav", mode="train"
         ):
 
-        self.data = json.load(open(audio_json, 'r'))
+        self.data = json.load(open(audio_json, 'r'))['data']
         self.audio_path_root = audio_path_root
+        self.meta_path_root = meta_path_root
 
         self.reverb_path_root = reverb_path_root
         self.reverb = json.load(open(reverb_json, 'r'))['data']
         self.reverb_type = reverb_type
-        self.channel_num = 2 if reverb_type == 'binaural' else 9 if reverb_type == 'ambisonics' else 1
+        self.channel_num = 2 if reverb_type == 'binaural' else 9 if reverb_type == 'ambisonics' else 4 if reverb_type == "tetra" else 1
         
         self.audio_conf = audio_conf
         print('---------------the {:s} dataloader---------------'.format(self.audio_conf.get('mode')))
@@ -185,6 +194,16 @@ class MultichannelDataset(Dataset):
         }   
         return spaital_targets
 
+
+    def fetch_rounded_spatial_targets(self, targets):
+        
+        spaital_targets = { 
+            "distance": [round(dist * 2) for dist in targets["distance"]],         
+            "azimuth": [(round(azi)+ 360) % 360 for azi in targets["azimuth"]],
+            "elevation": [(round(ele) + 90) % 180 for ele in targets["elevation"]]       
+        } 
+        return spaital_targets
+    
     def __getitem__(self, index):
         """
         Fetches and processes a single audio sample and its associated data.
@@ -197,87 +216,59 @@ class MultichannelDataset(Dataset):
         """
         datum = self.data[index]
         label_indices = np.zeros(self.label_num)
-        audio_path = os.path.join(self.audio_path_root, datum['folder'], datum['id'] + self._ext_audio)
-                
-        reverb_item = random.choice(self.reverb)
-        spaital_targets = self.fetch_spatial_targets(reverb_item)
-        reverb_path = os.path.join(self.reverb_path_root, self.reverb_type, reverb_item['fname'])
-        reverb = torch.from_numpy(np.load(reverb_path)).float()
+        audio_path = os.path.join(self.audio_path_root, datum['fname'] + self._ext_audio)
 
-        reverb_padding = 32000 * 2 - reverb.shape[1]
-        if reverb_padding > 0:
-            reverb = F.pad(reverb, (0, reverb_padding), 'constant', 0)
-        elif reverb_padding < 0:
-            reverb = reverb[:, :32000 * 2]
+        adpit_path = os.path.join(self.meta_path_root, datum['fname'] + ".npy")
+        adpit_label = np.load(adpit_path)
+        adpit_label = torch.from_numpy(adpit_label).float()
 
+        spaital_targets = self.fetch_rounded_spatial_targets(datum)
+        
         waveform, sr = sf.read(audio_path)
-        waveform = waveform[:, 0] if len(waveform.shape) > 1 else waveform
+        if waveform.shape[1] == 32: # leave this for now until we get the 32 channel fixed to 4ch only
+            waveform = waveform[:, [5, 9, 25, 21]]
         waveform = signal.resample_poly(waveform, 32000, sr) if sr != 32000 else waveform   
-        waveform = normalize_audio(waveform, -14.0) if self.normalize else waveform
+        waveform = torch.from_numpy(waveform.T).float()
 
-        waveform = torch.from_numpy(waveform).reshape(1, -1).float()
-        if self.roll_mag_aug:
-            waveform = self._roll_mag_aug(waveform)
+        mix_lambda = np.random.beta(10, 10)
+        label_indices = np.zeros(self.label_num * 2)  # initialize the label (*2 since we predict 2 classes now)
 
-        # We pad all audio samples into 10 seconds long
-        padding = 32000 * 10 - waveform.shape[1]
-        if padding > 0:
-            waveform = F.pad(waveform, (0, padding), 'constant', 0)
-        elif padding < 0:
-            waveform = waveform[:, :32000 * 10]
-
-        label_indices = np.zeros(self.label_num)  # initialize the label
-
-         # for audio_exp, when using mixup, assume multilabel
-        if random.random() > self.mixup:
-            for label_str in datum['label']:
-                label_indices[int(self.index_dict[label_str])] = 1.0
-        else:
-            mix_sample_idx = random.randint(0, len(self.data)-1)
-            mix_datum = self.data[mix_sample_idx]
-
-            mix_audio_path = os.path.join(self.audio_path_root, mix_datum['folder'], mix_datum['id'] + self._ext_audio)
-            mix_waveform, sr = sf.read(mix_audio_path)
-            mix_waveform = mix_waveform[:, 0] if len(mix_waveform.shape) > 1 else mix_waveform
-            mix_waveform = signal.resample_poly(mix_waveform, 32000, sr) if sr != 32000 else mix_waveform
-            mix_waveform = normalize_audio(mix_waveform, -14.0) if self.normalize else mix_waveform
-            mix_waveform = torch.from_numpy(mix_waveform).reshape(1, -1).float()
-
-            if self.roll_mag_aug:
-                mix_waveform = self._roll_mag_aug(mix_waveform)
-
-            mix_padding = 32000 * 10 - mix_waveform.shape[1]
-            if mix_padding > 0:
-                mix_waveform = F.pad(mix_waveform, (0, mix_padding), 'constant', 0)
-            elif mix_padding < 0:
-                mix_waveform = mix_waveform[:, :32000 * 10]
-            
-            mix_lambda = np.random.beta(10, 10)
-            waveform = mix_lambda * waveform + (1 - mix_lambda) * mix_waveform
-
-            # add sample 1 labels
-            for label_str in datum['label']:
-                label_indices[int(self.index_dict[label_str])] += mix_lambda
-            # add sample 2 labels
-            for label_str in mix_datum['label']:
-                label_indices[int(self.index_dict[label_str])] += 1.0 - mix_lambda
+        for i, label_str in enumerate(datum['class']):
+            label_indices[self.index_dict[label_str] + i*self.label_num] = 1.0
 
         label_indices = torch.FloatTensor(label_indices)
-        return waveform, reverb, label_indices, spaital_targets, audio_path, reverb_path
+        return waveform, None, label_indices, spaital_targets, audio_path, None, adpit_label
 
     def __len__(self):
         return len(self.data)
 
     def collate_fn(self, batch):
-        waveforms, reverbs, label_indices, spaital_targets, audio_path, reverb_path = zip(*batch)
+        waveforms, reverbs, label_indices, spatial_targets, audio_path, reverb_path, adpit_label = zip(*batch)
         waveforms = torch.stack(waveforms)
+
+        adpit_label = torch.stack(adpit_label)
+        B = waveforms.shape[0]
         
-        reverbs = torch.stack(reverbs)
-
         # spaital_targets
-        spatial_targets_dict = {}
-        spatial_targets_dict['distance'] = torch.LongTensor([x['distance'] for x in spaital_targets])
-        spatial_targets_dict['azimuth'] = torch.LongTensor([x['azimuth'] for x in spaital_targets])
-        spatial_targets_dict['elevation'] = torch.LongTensor([x['elevation'] for x in spaital_targets])
+        spatial_targets_dict = {
+            'distance': torch.zeros((B, 2), dtype=torch.long),
+            'azimuth': torch.zeros((B, 2), dtype=torch.long),
+            'elevation': torch.zeros((B, 2), dtype=torch.long)
+        }
 
-        return waveforms, reverbs, torch.stack(label_indices), spatial_targets_dict, audio_path, reverb_path
+        # Process spatial targets
+        for i, target in enumerate(spatial_targets):
+            spatial_targets_dict['distance'][i] = torch.cat([
+                torch.tensor(target['distance'], dtype=torch.long), 
+                torch.zeros(2 - len(target['distance']), dtype=torch.long)
+            ])
+            spatial_targets_dict['azimuth'][i] = torch.cat([
+                torch.tensor(target['azimuth'], dtype=torch.long), 
+                torch.zeros(2 - len(target['azimuth']), dtype=torch.long)
+            ])
+            spatial_targets_dict['elevation'][i] = torch.cat([
+                torch.tensor(target['elevation'], dtype=torch.long), 
+                torch.zeros(2 - len(target['elevation']), dtype=torch.long)
+            ])
+
+        return waveforms, None, torch.stack(label_indices), spatial_targets_dict, audio_path, None, adpit_label
