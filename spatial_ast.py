@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 
 import torchaudio
+import soundfile as sf
 
 from timm.models.layers import to_2tuple, trunc_normal_
 
@@ -60,10 +61,12 @@ class SpatialAST(_VisionTransformer):
         self.num_cls_tokens = num_cls_tokens
         self.cls_tokens = nn.Parameter(torch.zeros(1, num_cls_tokens, emb_dim))
         torch.nn.init.normal_(self.cls_tokens, std=.02)
+        self.num_classes = 15 # [asroman] - this will have to change to 355 I believe
+
 
         self.patch_embed = PatchEmbed_new(
             img_size=img_size, patch_size=(16,16), 
-            in_chans=in_chans, embed_dim=emb_dim, stride=16
+            in_chans=in_chans, embed_dim=emb_dim, stride=16 # might need to change this to 4? not sure yet
         ) # no overlap. stride=img_size=16
         w = self.patch_embed.proj.weight.data
         torch.nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
@@ -85,8 +88,15 @@ class SpatialAST(_VisionTransformer):
             fmax=14000, ref=1.0, amin=1e-10, top_db=None, freeze_parameters=True
         )
         
+        # self.conv_downsample = nn.Sequential(
+        #     conv3x3(4, 1), 
+        #     nn.BatchNorm2d(1),
+        #     nn.GELU(),
+        # )
+
+        # Changed this to sample down to 4 channels
         self.conv_downsample = nn.Sequential(
-            conv3x3(4, 1), 
+            conv3x3(16, 1), 
             nn.BatchNorm2d(1),
             nn.GELU(),
         )
@@ -94,7 +104,7 @@ class SpatialAST(_VisionTransformer):
         self.timem = torchaudio.transforms.TimeMasking(192)
         self.freqm = torchaudio.transforms.FrequencyMasking(48)
 
-        self.bn = nn.BatchNorm2d(2, affine=False)
+        self.bn = nn.BatchNorm2d(4, affine=False) # changed this to 4 channels
         del self.norm  # remove the original norm
 
         self.target_frame = 1024
@@ -103,14 +113,17 @@ class SpatialAST(_VisionTransformer):
         self.doa_norm = kwargs['norm_layer'](emb_dim)
         self.fc_norm = kwargs['norm_layer'](emb_dim)
 
-        self.distance_head = nn.Linear(emb_dim, 21) # [0:10:0.5], 21 classes 
-        self.azimuth_head = nn.Linear(emb_dim, 360)
-        self.elevation_head = nn.Linear(emb_dim, 180)
+        self.distance_head = nn.Linear(emb_dim, 21) # [0:10:0.5], 21 classes, Account for up to 2 active sound locations 
+        self.azimuth_head = nn.Linear(emb_dim, 360) # Account for up to 2 active sound locations
+        self.elevation_head = nn.Linear(emb_dim, 180) # Account for up to 2 active sound locations
 
         trunc_normal_(self.head.weight, std=2e-5)
         trunc_normal_(self.distance_head.weight, std=2e-5)
         trunc_normal_(self.azimuth_head.weight, std=2e-5)
         trunc_normal_(self.elevation_head.weight, std=2e-5)
+
+        self.fnn_tokens = nn.Linear(emb_dim * 3, self.num_classes*3*3) # project tokens to Multi-ACCDOA format (embed_dim, 3*3*num_classes)
+
 
     def random_masking_2d(self, x, mask_t_prob, mask_f_prob):
         N, L, D = x.shape  # batch, length, dim
@@ -163,25 +176,39 @@ class SpatialAST(_VisionTransformer):
 
         return x
 
+    
     # overwrite original timm
+    # need to edit this
     def forward(self, waveforms, reverbs, mask_t_prob=0.0, mask_f_prob=0.0):
-        waveforms = torchaudio.functional.fftconvolve(waveforms, reverbs, mode='full')[..., :waveforms.shape[-1]]
+        #waveforms = torchaudio.functional.fftconvolve(waveforms, reverbs*0.1258, mode='full')[..., :waveforms.shape[-1]]
+        # Call LAM encoder
+        #lam_tokens = self.lam_model(waveforms)
         B, C, T = waveforms.shape
 
         waveforms = waveforms.reshape(B * C, T)
+        
         real, imag = self.spectrogram_extractor(waveforms) 
 
         log_mel = self.logmel_extractor(torch.sqrt(real**2 + imag**2)).reshape(B, C, -1, 128)
         log_mel = self.bn(log_mel)
         
-        IPD = torch.atan2(imag[1::2], real[1::2]) - torch.atan2(imag[::2], real[::2])
+        # Compute IPD between channel pairs (1 vs 2, and 3 vs 4)
+        IPD_12 = torch.atan2(imag[1::4], real[1::4]) - torch.atan2(imag[0::4], real[0::4])  # mic 1 vs mic 2
+        IPD_13 = torch.atan2(imag[2::4], real[2::4]) - torch.atan2(imag[0::4], real[0::4])  # mic 1 vs mic 3
+        IPD_14 = torch.atan2(imag[3::4], real[3::4]) - torch.atan2(imag[0::4], real[0::4])  # mic 1 vs mic 4
+        IPD_23 = torch.atan2(imag[2::4], real[2::4]) - torch.atan2(imag[1::4], real[1::4])  # mic 2 vs mic 3
+        IPD_24 = torch.atan2(imag[3::4], real[3::4]) - torch.atan2(imag[1::4], real[1::4])  # mic 2 vs mic 4
+        IPD_34 = torch.atan2(imag[3::4], real[3::4]) - torch.atan2(imag[2::4], real[2::4])  # mic 3 vs mic 4
+        # Concatenate the IPD results along the channel dimension
+        IPD = torch.cat([IPD_12, IPD_13, IPD_14, IPD_23, IPD_24, IPD_34], dim=1)
         x = torch.cat([log_mel, torch.matmul(torch.cat([torch.cos(IPD), torch.sin(IPD)], dim=1), self.logmel_extractor.melW)], dim=1)
         # x = log_mel
 
         if x.shape[2] < self.target_frame:
-            x = nn.functional.interpolate(x, (self.target_frame, x.shape[3]), mode="bicubic", align_corners=True)
-    
+            x = nn.functional.interpolate(x, (self.target_frame, x.shape[3]), mode="bicubic", align_corners=True) # might need to modify this
+
         x = self.conv_downsample(x)
+
         if self.training:
             x = x.transpose(-2, -1) # bsz, 4, 1024, 128 --> bsz, 4, 128, 1024
             x = self.freqm(x)
@@ -195,16 +222,22 @@ class SpatialAST(_VisionTransformer):
         doa_token = x[:, 1]
         cls_tokens = x[:, 2]
 
-        dis_token = self.dis_norm(dis_token)
-        doa_token = self.doa_norm(doa_token)
-        cls_tokens = self.fc_norm(cls_tokens)
+        #dis_token = self.dis_norm(dis_token)
+        #doa_token = self.doa_norm(doa_token)
+        #cls_tokens = self.fc_norm(cls_tokens)
 
-        classifier = self.head(cls_tokens)
-        distance = self.distance_head(dis_token)
-        azimuth = self.azimuth_head(doa_token)
-        elevation = self.elevation_head(doa_token)
+        all_tokens = torch.cat([dis_token, doa_token, cls_tokens], dim=1)
+        all_tokens = torch.tanh(self.fnn_tokens(all_tokens))
 
-        return classifier, distance, azimuth, elevation
+        device = all_tokens.device
+
+        # 8, 30]) torch.Size([8, 21]) torch.Size([8, 360]) torch.Size([8, 180
+        classifier = self.head(torch.zeros_like(cls_tokens))
+        distance = self.distance_head(torch.zeros_like(dis_token))
+        azimuth = self.azimuth_head(torch.zeros_like(doa_token))
+        elevation = self.elevation_head(torch.zeros_like(doa_token))
+        #print("torch shapes", classifier.shape, distance.shape, azimuth.shape, elevation.shape)
+        return classifier, distance, azimuth, elevation, all_tokens
 
 
 def build_AST(**kwargs):
