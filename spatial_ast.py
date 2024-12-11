@@ -231,7 +231,6 @@ class SpatialAST(_VisionTransformer):
 
         device = all_tokens.device
 
-        # 8, 30]) torch.Size([8, 21]) torch.Size([8, 360]) torch.Size([8, 180
         classifier = self.head(torch.zeros_like(cls_tokens))
         distance = self.distance_head(torch.zeros_like(dis_token))
         azimuth = self.azimuth_head(torch.zeros_like(doa_token))

@@ -105,7 +105,6 @@ def make_index_dict(label_csv):
         reader = csv.reader(f)
         next(reader)  # Skip header
         for row in reader:
-            print(row)
             index, mid = row[0], row[1]
             display_name = ",".join(row[2:])
             # index_lookup[row['mid']] = row['index']
@@ -231,10 +230,11 @@ class MultichannelDataset(Dataset):
         waveform = torch.from_numpy(waveform.T).float()
 
         mix_lambda = np.random.beta(10, 10)
-        label_indices = np.zeros(self.label_num * 2)  # initialize the label (*2 since we predict 2 classes now)
+        label_indices = np.zeros(self.label_num)  # initialize the label (*2 since we predict 2 classes now)
 
-        for i, label_str in enumerate(datum['class']):
-            label_indices[self.index_dict[label_str] + i*self.label_num] = 1.0
+        #for i, label_str in enumerate(datum['class']):
+        #   label_indices[self.index_dict[label_str] + i*self.label_num] = 1.0
+        label_indices[self.index_dict[datum['class'][0]]] = 1.0
 
         label_indices = torch.FloatTensor(label_indices)
         return waveform, None, label_indices, spaital_targets, audio_path, None, adpit_label
@@ -270,5 +270,6 @@ class MultichannelDataset(Dataset):
                 torch.tensor(target['elevation'], dtype=torch.long), 
                 torch.zeros(2 - len(target['elevation']), dtype=torch.long)
             ])
+        
 
         return waveforms, None, torch.stack(label_indices), spatial_targets_dict, audio_path, None, adpit_label

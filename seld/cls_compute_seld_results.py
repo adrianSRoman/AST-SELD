@@ -1,6 +1,6 @@
 import os
-import SELD_evaluation_metrics
-import parameters
+import seld.SELD_evaluation_metrics
+import seld.parameters
 import numpy as np
 from scipy import stats
 
