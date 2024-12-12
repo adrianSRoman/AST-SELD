@@ -87,7 +87,7 @@ class SpatialAST(_VisionTransformer):
             sr=32000, n_fft=1024, n_mels=128, fmin=50, 
             fmax=14000, ref=1.0, amin=1e-10, top_db=None, freeze_parameters=True
         )
-        
+         
         # self.conv_downsample = nn.Sequential(
         #     conv3x3(4, 1), 
         #     nn.BatchNorm2d(1),
@@ -123,6 +123,25 @@ class SpatialAST(_VisionTransformer):
         trunc_normal_(self.elevation_head.weight, std=2e-5)
 
         self.fnn_tokens = nn.Linear(emb_dim * 3, self.num_classes*3*3) # project tokens to Multi-ACCDOA format (embed_dim, 3*3*num_classes)
+        self.gru_input_dim = 768*2 #params['nb_cnn2d_filt'] * int(np.floor(in_feat_shape[-1] / np.prod(params['f_pool_size'])))
+        self.gru = torch.nn.GRU(input_size=self.gru_input_dim, hidden_size=128,
+                                num_layers=2, batch_first=True,
+                                dropout=0.05, bidirectional=True)
+
+        self.mhsa_block_list = nn.ModuleList()
+        self.layer_norm_list = nn.ModuleList()
+        for mhsa_cnt in range(2):
+            self.mhsa_block_list.append(nn.MultiheadAttention(embed_dim=128, num_heads=4, dropout=0.05,  batch_first=True))
+            self.layer_norm_list.append(nn.LayerNorm(128))
+
+        self.fnn_list = torch.nn.ModuleList()
+        
+        for fc_cnt in range(1):
+            self.fnn_list.append(nn.Linear(128 if fc_cnt else 128, 128, bias=True))
+        
+        self.fnn_list.append(nn.Linear(128, self.num_classes*3*3, bias=True))
+
+
 
 
     def random_masking_2d(self, x, mask_t_prob, mask_f_prob):
@@ -226,8 +245,39 @@ class SpatialAST(_VisionTransformer):
         #doa_token = self.doa_norm(doa_token)
         #cls_tokens = self.fc_norm(cls_tokens)
 
-        all_tokens = torch.cat([dis_token, doa_token, cls_tokens], dim=1)
-        all_tokens = torch.tanh(self.fnn_tokens(all_tokens))
+        #print(dis_token.shape, doa_token.shape, cls_tokens.shape)
+        all_tokens = torch.cat([doa_token, cls_tokens], dim=1)
+        all_tokens = all_tokens.unsqueeze(1)
+        #print("all tokens shape", all_tokens.shape)
+
+        (x, _) = self.gru(all_tokens) 
+        x = torch.tanh(x)
+        #print("shape of out from GRU", x.shape)
+            
+        #print("Input shape to MHSA", x.shape)
+        x = x[:, :, x.shape[-1]//2:] * x[:, :, :x.shape[-1]//2]
+        #print(x.shape) 
+
+        # pos_embedding = self.pos_embedder(x)
+        # x = x + pos_embedding
+            
+        for mhsa_cnt in range(len(self.mhsa_block_list)):
+            x_attn_in = x 
+            x, _ = self.mhsa_block_list[mhsa_cnt](x_attn_in, x_attn_in, x_attn_in)
+            x = x + x_attn_in
+            x = self.layer_norm_list[mhsa_cnt](x)
+
+        x = torch.tanh(x)
+
+        for fnn_cnt in range(len(self.fnn_list) - 1):
+            x = self.fnn_list[fnn_cnt](x)
+        all_tokens = torch.tanh(self.fnn_list[-1](x))
+        #print("doa.shape", all_tokens.shape)
+        all_tokens = all_tokens.squeeze(1)
+        #print("doa.shape", all_tokens.shape)
+        #all_tokens = torch.tanh(self.fnn_tokens(all_tokens))
+
+        #print("CLS toekn shape", cls_tokens.shape) 
 
         device = all_tokens.device
 
