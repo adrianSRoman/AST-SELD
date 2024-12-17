@@ -31,6 +31,8 @@ from data.dataset import DistributedSamplerWrapper, DistributedWeightedSampler, 
 import spatial_ast
 from engine_finetune import evaluate, train_one_epoch
 
+from utils.loss import MSELoss_ADPIT
+
 def get_args_parser():
     parser = argparse.ArgumentParser('MAE fine-tuning for image classification', add_help=False)
     parser.add_argument('--batch_size', default=4, type=int,
@@ -142,6 +144,7 @@ def get_args_parser():
 
     # For audioset
     parser.add_argument("--audio_path_root", type=str, default='/path/to/audioset', help="audioset folder path")
+    parser.add_argument("--meta_path_root", type=str, default='/path/to/metadata', help="metadata SELD folder path")
     parser.add_argument("--audioset_train", type=str, default='/path/to/train', help="training data json")
     parser.add_argument("--audioset_eval", type=str, default='/path/to/eval', help="validation data json")
     parser.add_argument("--label_csv", type=str, default='', help="csv with class labels")
@@ -154,7 +157,7 @@ def get_args_parser():
     parser.add_argument("--use_soft", type=bool, default=False)
     parser.add_argument('--audio_normalize', action='store_true', help='normalize the audio')
 
-    #parser.add_argument("--distributed", type=bool, default=True)
+    parser.add_argument("--distributed", type=bool, default=True)
     parser.add_argument('--first_eval_ep', default=0, type=int, help='do eval after first_eval_ep')
     parser.add_argument('--use_custom_patch', action='store_true', default=False, help='use custom patch with overlapping and override timm PatchEmbed')
     parser.add_argument('--source_custom_patch', action='store_true', default=False, help='the pre-trained model already use custom patch')
@@ -170,7 +173,7 @@ def get_args_parser():
     parser.add_argument('--load_imgnet_pt', action='store_true', default=False, help='when img_pt_ckpt, if load_imgnet_pt, use img_pt_ckpt to initialize audio branch, if not, keep audio branch random')
     
     parser.add_argument('--reverb_path_root', type=str, default='/path/to/reverberation', help='reverb folder path')
-    parser.add_argument('--reverb_type', type=str, default='binaural', choices=['binaural', 'mono'], help='reverb type')
+    parser.add_argument('--reverb_type', type=str, default='binaural', choices=['binaural', 'mono', 'tetra'], help='reverb type')
     parser.add_argument('--reverb_train_json', type=str, default='/path/to/reverberation.json', help='reverb train json')
     parser.add_argument('--reverb_val_json', type=str, default='/path/to/reverberation.json', help='reverb val json')
 
@@ -227,6 +230,7 @@ def main(args):
         audio_json=args.audioset_train,
         audio_conf=audio_conf_train,
         audio_path_root=args.audio_path_root,
+        meta_path_root=args.meta_path_root,
         reverb_json=args.reverb_train_json,
         reverb_type=args.reverb_type,
         reverb_path_root=args.reverb_path_root,
@@ -241,6 +245,7 @@ def main(args):
         audio_json=args.audioset_eval,
         audio_conf=audio_conf_val, 
         audio_path_root=args.audio_path_root,
+        meta_path_root=args.meta_path_root,
         reverb_json=args.reverb_val_json, 
         reverb_type=args.reverb_type, 
         reverb_path_root=args.reverb_path_root,
@@ -337,8 +342,19 @@ def main(args):
     #if args.finetune and not args.eval:
     if args.finetune:
         checkpoint = torch.load(args.finetune, map_location='cpu')
+        # Reshape the BatchNorm running_mean and running_var from [2] to [4]
+        checkpoint['model']['bn.running_mean'] = torch.cat([checkpoint['model']['bn.running_mean'], torch.zeros(2)])
+        checkpoint['model']['bn.running_var'] = torch.cat([checkpoint['model']['bn.running_var'], torch.zeros(2)])
+
         print("Load pre-trained checkpoint from: %s" % args.finetune)
         checkpoint_model = checkpoint['model']
+
+        # Removing conv down layers
+        keys_to_remove = [key for key in checkpoint_model.keys() if 'conv_downsample' in key ]
+        for key in keys_to_remove:
+            del checkpoint_model[key]
+
+            
         state_dict = model.state_dict()
 
         if not args.eval:
@@ -417,8 +433,9 @@ def main(args):
         if args.distributed:
             data_loader_train.sampler.set_epoch(epoch)
         
+        criterion_2 = MSELoss_ADPIT()
         train_stats = train_one_epoch(
-                model, criterion, data_loader_train,
+                model, criterion_2, data_loader_train,
                 optimizer, device, epoch, loss_scaler,
                 args.clip_grad, mixup_fn,
                 log_writer=log_writer,
