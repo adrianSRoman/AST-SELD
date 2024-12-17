@@ -123,7 +123,7 @@ class SpatialAST(_VisionTransformer):
         trunc_normal_(self.elevation_head.weight, std=2e-5)
 
         self.fnn_tokens = nn.Linear(emb_dim * 3, self.num_classes*3*3) # project tokens to Multi-ACCDOA format (embed_dim, 3*3*num_classes)
-        self.gru_input_dim = 768*2 #params['nb_cnn2d_filt'] * int(np.floor(in_feat_shape[-1] / np.prod(params['f_pool_size'])))
+        self.gru_input_dim = emb_dim * 3 
         self.gru = torch.nn.GRU(input_size=self.gru_input_dim, hidden_size=128,
                                 num_layers=2, batch_first=True,
                                 dropout=0.05, bidirectional=True)
@@ -137,7 +137,7 @@ class SpatialAST(_VisionTransformer):
         self.fnn_list = torch.nn.ModuleList()
         
         for fc_cnt in range(1):
-            self.fnn_list.append(nn.Linear(128 if fc_cnt else 128, 128, bias=True))
+            self.fnn_list.append(nn.Linear(128, 128, bias=True))
         
         self.fnn_list.append(nn.Linear(128, self.num_classes*3*3, bias=True))
 
@@ -181,9 +181,12 @@ class SpatialAST(_VisionTransformer):
         B = x.shape[0] #bsz, 512, 768 (unmasked)
 
         x = x + self.pos_embed[:, 1:, :]
-
-        if mask_t_prob > 0.0 or mask_f_prob > 0.0:
-            x, mask, ids_restore = self.random_masking_2d(x, mask_t_prob, mask_f_prob)
+        
+        ## Commenting masking to achieve overfitting
+        #if mask_t_prob > 0.0 or mask_f_prob > 0.0:
+        #    print("before random masking", x.shape)
+        #    x, mask, ids_restore = self.random_masking_2d(x, mask_t_prob, mask_f_prob)
+        #    print("after random masking", x.shape)
 
         cls_tokens = self.cls_tokens
         cls_tokens = cls_tokens.expand(B, -1, -1)
@@ -228,14 +231,16 @@ class SpatialAST(_VisionTransformer):
 
         x = self.conv_downsample(x)
 
-        if self.training:
-            x = x.transpose(-2, -1) # bsz, 4, 1024, 128 --> bsz, 4, 128, 1024
-            x = self.freqm(x)
-            x = self.timem(x)
-            x = x.transpose(-2, -1)
-
+        ## Commenting masking to achieve overfitting
+        #if self.training:
+        #    x = x.transpose(-2, -1) # bsz, 4, 1024, 128 --> bsz, 4, 128, 1024
+        #    x = self.freqm(x)
+        #    x = self.timem(x)
+        #    x = x.transpose(-2, -1)
+        
         x = self.patch_embed(x)
         x = self.forward_features_mask(x, mask_t_prob=mask_t_prob, mask_f_prob=mask_f_prob)
+
 
         dis_token = x[:, 0]
         doa_token = x[:, 1]
@@ -246,7 +251,7 @@ class SpatialAST(_VisionTransformer):
         #cls_tokens = self.fc_norm(cls_tokens)
 
         #print(dis_token.shape, doa_token.shape, cls_tokens.shape)
-        all_tokens = torch.cat([doa_token, cls_tokens], dim=1)
+        all_tokens = torch.cat([dis_token, doa_token, cls_tokens], dim=1)
         all_tokens = all_tokens.unsqueeze(1)
         #print("all tokens shape", all_tokens.shape)
 
